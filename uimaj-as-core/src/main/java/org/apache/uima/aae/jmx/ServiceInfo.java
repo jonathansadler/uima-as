@@ -19,10 +19,16 @@
 
 package org.apache.uima.aae.jmx;
 
+import org.apache.uima.UIMAFramework;
+import org.apache.uima.aae.UIMAEE_Constants;
+import org.apache.uima.aae.controller.AggregateAnalysisEngineController_impl;
 import org.apache.uima.aae.controller.AnalysisEngineController;
 import org.apache.uima.aae.controller.BaseAnalysisEngineController.ServiceState;
+import org.apache.uima.util.Level;
 
 public class ServiceInfo implements ServiceInfoMBean {
+  private static final Class CLASS_NAME = ServiceInfoMBean.class;
+
   /**
 	 * 
 	 */
@@ -99,6 +105,14 @@ public class ServiceInfo implements ServiceInfoMBean {
     }
   }
 
+  public String dumpState() {
+    if ( controller != null ) {
+      StringBuffer buffer = new StringBuffer();
+      controller.dumpState(buffer,"  ");
+      return buffer.toString();
+    }    
+    return "";
+  }
   public void setState(String aState) {
     state = aState;
   }

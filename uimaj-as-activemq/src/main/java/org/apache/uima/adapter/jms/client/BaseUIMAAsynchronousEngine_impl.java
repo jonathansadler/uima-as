@@ -43,7 +43,9 @@ import javax.naming.InitialContext;
 
 import org.apache.activemq.ActiveMQConnection;
 import org.apache.activemq.ActiveMQConnectionFactory;
+import org.apache.activemq.ActiveMQMessageConsumer;
 import org.apache.activemq.ActiveMQPrefetchPolicy;
+import org.apache.activemq.ActiveMQSession;
 import org.apache.activemq.RedeliveryPolicy;
 import org.apache.activemq.command.ActiveMQBytesMessage;
 import org.apache.activemq.command.ActiveMQDestination;
@@ -124,6 +126,8 @@ public class BaseUIMAAsynchronousEngine_impl extends BaseUIMAAsynchronousEngineC
   protected InitialContext jndiContext;
   
   private ObjectName clientJmxObjectName = null;
+  
+  
   public BaseUIMAAsynchronousEngine_impl() {
     UIMAFramework.getLogger(CLASS_NAME).log(Level.INFO,
             "UIMA-AS version " + UIMAFramework.getVersionString());
@@ -223,18 +227,41 @@ public class BaseUIMAAsynchronousEngine_impl extends BaseUIMAAsynchronousEngineC
     }
 
   }
-
+  private void stopConnection() {
+    if (sharedConnection != null) {
+      // Remove a client from registry
+      sharedConnection.unregisterClient(this);
+      // The destroy method closes the JMS connection when
+      // the number of
+      // clients becomes 0, otherwise it is a no-op
+      if (sharedConnection.destroy()) {
+        // This needs to be done to invalidate the
+        // object for JUnit tests
+        sharedConnection = null;
+      }
+    }
+  }
 	public void stop() {
-		if (!running) {
-			return;
-		}
-		super.stop();
 		synchronized (connectionMux) {
-			running = false;
+      super.doStop();
+      if (!running) {
+        return;
+      }
+      running = false;
 			if (super.serviceDelegate != null) {
 				// Cancel all timers and purge lists
 				super.serviceDelegate.cleanup();
 			}
+      if (sender != null) {
+        sender.doStop();
+      }
+      if (initialized) {
+        try {
+           consumerSession.close();
+           ((ActiveMQMessageConsumer)consumer).stop();
+           consumer.close();
+        } catch (Exception exx) {}
+      }
 			try {
 				// SharedConnection object manages a single JMS connection to
 				// the broker. If the client is scaled out in the same JVM, the
@@ -244,19 +271,10 @@ public class BaseUIMAAsynchronousEngine_impl extends BaseUIMAAsynchronousEngineC
 				// connection. The connection is closed when the last client calls stop().
 				try {
 					sharedConnectionSemaphore.acquire();
-					if (sharedConnection != null) {
-						// Remove a client from registry
-						sharedConnection.unregisterClient(this);
-						// The destroy method closes the JMS connection when
-						// the number of
-						// clients becomes 0, otherwise it is a no-op
-						if (sharedConnection.destroy()) {
-							// This needs to be done to invalidate the
-							// object for JUnit tests
-							sharedConnection = null;
-						}
-					}
+					stopConnection();
 				} catch (InterruptedException ex) {
+				  // Force connection stop
+          stopConnection();
 					if (UIMAFramework.getLogger(CLASS_NAME).isLoggable(
 							Level.WARNING)) {
 						UIMAFramework.getLogger(CLASS_NAME).logrb(Level.WARNING,
@@ -267,9 +285,6 @@ public class BaseUIMAAsynchronousEngine_impl extends BaseUIMAAsynchronousEngineC
 				} finally {
 					sharedConnectionSemaphore.release();
 				}
-				if (sender != null) {
-					sender.doStop();
-				}
 				// Undeploy all containers
 				undeploy();
 				if (UIMAFramework.getLogger(CLASS_NAME).isLoggable(
@@ -278,13 +293,6 @@ public class BaseUIMAAsynchronousEngine_impl extends BaseUIMAAsynchronousEngineC
 							CLASS_NAME.getName(), "stop",
 							JmsConstants.JMS_LOG_RESOURCE_BUNDLE,
 							"UIMAJMS_undeployed_containers__INFO");
-				}
-				if (initialized) {
-					try {
-						consumerSession.close();
-						consumer.close();
-					} catch (JMSException exx) {
-					}
 				}
 				// unregister client
 				if (jmxManager != null) {
@@ -543,6 +551,11 @@ public class BaseUIMAAsynchronousEngine_impl extends BaseUIMAAsynchronousEngineC
    */
   public synchronized void initialize(Map anApplicationContext)
           throws ResourceInitializationException {
+    // Add ShutdownHook to make sure the connection to the
+    // broker is always closed on process exit.
+    shutdownHookThread = new Thread(new UimaASShutdownHook(this));
+    Runtime.getRuntime().addShutdownHook(shutdownHookThread);
+           
     // Check the version of uimaj that UIMA AS was built with, against the UIMA Core version. If not the same throw Exception
     if (!UimaAsVersion.getUimajFullVersionString().equals(UimaVersion.getFullVersionString())) {
       UIMAFramework.getLogger(CLASS_NAME).logrb(
@@ -697,6 +710,17 @@ public class BaseUIMAAsynchronousEngine_impl extends BaseUIMAAsynchronousEngineC
                       "UIMAJMS_client_interrupted_while_acquiring_getmeta_semaphore__WARNING");
             }
       }
+      //  Add a delay of 100ms before sending a request for metadata to remote service.
+      //  This is done to give the broker enough time to 'finalize' creation of
+      //  temp reply queue. It's been observed (on MAC OS only) that AMQ
+      //  broker QueueSession.createTemporaryQueue() call is not synchronous. Meaning,
+      //  return from createTemporaryQueue() does not guarantee immediate availability
+      //  of the temp queue. It seems like this operation is asynchronous, causing: 
+      //  "InvalidDestinationException: Cannot publish to a deleted Destination..."
+      //  on the service side when it tries to reply to the client.
+      try {
+        wait(100);
+      } catch( InterruptedException e) {}
       sendMetaRequest();
       waitForMetadataReply();
       if (abort || !running) {

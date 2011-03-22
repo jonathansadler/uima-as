@@ -290,8 +290,15 @@ public class PrimitiveAnalysisEngineController_impl extends BaseAnalysisEngineCo
               }
             }
             if (isTopLevelComponent()) {
+              // add delay to allow controller listener to plug itself in
+              synchronized(this) {
+                try {
+                  this.wait(100);
+                } catch(Exception exx) {}
+              }
+              
               super.notifyListenersWithInitializationStatus(null);
-            }
+            } 
 
             // All internal components of this Primitive have been initialized. Open the latch
             // so that this service can start processing requests.
@@ -324,7 +331,7 @@ public class PrimitiveAnalysisEngineController_impl extends BaseAnalysisEngineCo
           }
           super.serviceInitialized = true;
         }
-      }
+      } 
     } catch (AsynchAEException e) {
       if (UIMAFramework.getLogger(CLASS_NAME).isLoggable(Level.WARNING)) {
         UIMAFramework.getLogger(CLASS_NAME).logrb(Level.WARNING, CLASS_NAME.getName(),
@@ -393,7 +400,7 @@ public class PrimitiveAnalysisEngineController_impl extends BaseAnalysisEngineCo
         // Send CPC completion reply back to the client. Use internal (non-jms) transport
         transport.getUimaMessageDispatcher(anEndpoint.getEndpoint()).dispatch(message);
       } else {
-        getOutputChannel().sendReply(AsynchAEMessage.CollectionProcessComplete, anEndpoint);
+        getOutputChannel().sendReply(AsynchAEMessage.CollectionProcessComplete, anEndpoint, null, false);
       }
 
       if (UIMAFramework.getLogger(CLASS_NAME).isLoggable(Level.FINE)) {
@@ -774,7 +781,7 @@ public class PrimitiveAnalysisEngineController_impl extends BaseAnalysisEngineCo
         }
       } else {
         if (!stopped && !clientUnreachable ) {
-            getOutputChannel().sendReply(aCasReferenceId, anEndpoint);
+            getOutputChannel().sendReply(getInProcessCache().getCacheEntryForCAS(aCasReferenceId), anEndpoint);
         }
 
         inputCASReturned = true;
@@ -1067,5 +1074,9 @@ public class PrimitiveAnalysisEngineController_impl extends BaseAnalysisEngineCo
 	    }
 	  }
 
+  }
+
+  public void dumpState(StringBuffer buffer, String lbl1) {
+    buffer.append(getComponentName()+" State:"+getState());
   }
 }

@@ -40,6 +40,7 @@ import org.apache.uima.aae.InputChannel;
 import org.apache.uima.aae.UIMAEE_Constants;
 import org.apache.uima.aae.UimaClassFactory;
 import org.apache.uima.aae.InProcessCache.CacheEntry;
+import org.apache.uima.aae.controller.BaseAnalysisEngineController.ServiceState;
 import org.apache.uima.aae.controller.LocalCache.CasStateEntry;
 import org.apache.uima.aae.delegate.ControllerDelegate;
 import org.apache.uima.aae.delegate.Delegate;
@@ -481,7 +482,7 @@ public class AggregateAnalysisEngineController_impl extends BaseAnalysisEngineCo
       // Send reply back to the client. Use internal (non-jms) transport
       transport.getUimaMessageDispatcher(aClientEndpoint.getEndpoint()).dispatch(message);
     } else {
-      getOutputChannel().sendReply(AsynchAEMessage.CollectionProcessComplete, aClientEndpoint);
+      getOutputChannel().sendReply(AsynchAEMessage.CollectionProcessComplete, aClientEndpoint, null, false);
     }
 
     clearStats();
@@ -610,7 +611,7 @@ public class AggregateAnalysisEngineController_impl extends BaseAnalysisEngineCo
               }
             }
           } else {
-            getOutputChannel().sendRequest(AsynchAEMessage.CollectionProcessComplete, endpoint);
+            getOutputChannel().sendRequest(AsynchAEMessage.CollectionProcessComplete, null, endpoint);
             endpoint.startCollectionProcessCompleteTimer();
           }
         }
@@ -1008,8 +1009,12 @@ public class AggregateAnalysisEngineController_impl extends BaseAnalysisEngineCo
             // If the delegate CM is a remote, send a Free CAS notification
             if (delegateCM.getEndpoint().isRemote()) {
               parentCasStateEntry.getFreeCasNotificationEndpoint().setCommand(AsynchAEMessage.Stop);
+              Endpoint fcEndpoint = parentCasStateEntry.getFreeCasNotificationEndpoint();
+              fcEndpoint.setReplyEndpoint(true);
+              fcEndpoint.setIsCasMultiplier(true);
+              fcEndpoint.setFreeCasEndpoint(true);
               getOutputChannel().sendRequest(AsynchAEMessage.ReleaseCAS, entry.getCasReferenceId(),
-                      parentCasStateEntry.getFreeCasNotificationEndpoint());
+                      fcEndpoint);
             }
             // Check if a request to stop generation of new CASes from the parent of
             // this CAS has been sent to the CM. The Delegate object keeps track of
@@ -1136,7 +1141,7 @@ public class AggregateAnalysisEngineController_impl extends BaseAnalysisEngineCo
           // Remove a delegate endpoint from the single step list cached in the CAS entry
           Endpoint endpoint = (Endpoint_impl) entry.getDelayedSingleStepList().remove(0);
           // send the CAS to a collocated delegate from the delayed single step list.
-          dispatchProcessRequest(aCasReferenceId, endpoint, true);
+          dispatchProcessRequest(entry, endpoint, true);
         }
       } catch (Exception e) {
         if (UIMAFramework.getLogger(CLASS_NAME).isLoggable(Level.WARNING)) {
@@ -1244,13 +1249,13 @@ public class AggregateAnalysisEngineController_impl extends BaseAnalysisEngineCo
       String analysisEngineKey = aStep.getAnalysisEngineKey();
       // Find the endpoint for the delegate
       endpoint = lookUpEndpoint(analysisEngineKey, true);
+      CacheEntry cacheEntry = getInProcessCache().getCacheEntryForCAS(aCasReferenceId);
       if (endpoint != null) {
         endpoint.setController(this);
         CasStateEntry casStateEntry = getLocalCache().lookupEntry(aCasReferenceId);
         casStateEntry.resetReplyReceived();
         if (enableCasLogMap!=null && enableCasLogMap.containsKey(analysisEngineKey)) {
           //  Get a CAS
-          CacheEntry cacheEntry = getInProcessCache().getCacheEntryForCAS(aCasReferenceId);
           CAS cas = cacheEntry.getCas();
           logCasForEndpoint(analysisEngineKey, cas);
         }
@@ -1287,7 +1292,7 @@ public class AggregateAnalysisEngineController_impl extends BaseAnalysisEngineCo
                     "UIMAEE_next_step_dispatch__FINEST",
                     new Object[] { getComponentName(), analysisEngineKey, aCasReferenceId  });
           }
-          dispatchProcessRequest(aCasReferenceId, endpoint, true);
+          dispatchProcessRequest(cacheEntry, endpoint, true);
           if (UIMAFramework.getLogger(CLASS_NAME).isLoggable(Level.FINEST)) {
             UIMAFramework.getLogger(CLASS_NAME).logrb(Level.FINEST, CLASS_NAME.getName(),
                     "simpleStep", UIMAEE_Constants.JMS_LOG_RESOURCE_BUNDLE,
@@ -1431,7 +1436,7 @@ public class AggregateAnalysisEngineController_impl extends BaseAnalysisEngineCo
           casStateEntry.setNumberOfParallelDelegates(endpoints.length);
         }
         // Dispatch CAS to remote parallel delegates
-        dispatchProcessRequest(aCasReferenceId, endpoints, true);
+        dispatchProcessRequest(cacheEntry, endpoints, true);
       } else {
         // All delegates in a parallel step are co-located. Send the CAS
         // to the first delegate in the single step list.
@@ -1447,6 +1452,19 @@ public class AggregateAnalysisEngineController_impl extends BaseAnalysisEngineCo
 
   public void sendRequestForMetadataToRemoteDelegates() throws AsynchAEException {
     synchronized(childControllerList) {
+      //  Add a delay of 100ms before sending requests for metadata to remote delegates.
+      //  This is done to give the broker enough time to 'finalize' creation of
+      //  temp reply queues for each remote delegate. It's been observed (on MAC OS only) that AMQ
+      //  broker QueueSession.createTemporaryQueue() call is not synchronous. Meaning,
+      //  return from createTemporaryQueue() does not guarantee immediate availability
+      //  of the temp queue. It seems like this operation is asynchronous, causing: 
+      //  "InvalidDestinationException: Cannot publish to a deleted Destination..."
+      //  when a request is send quickly to a service before the broker 'finalizes'
+      //  creation of the temp queue.
+      try {
+        childControllerList.wait(100);
+      } catch( InterruptedException e) {}
+      
       if ( childControllerList.size() > 0 ) {
         for( AnalysisEngineController childController : childControllerList ) {
           if (childController instanceof AggregateAnalysisEngineController) {
@@ -1836,8 +1854,10 @@ public class AggregateAnalysisEngineController_impl extends BaseAnalysisEngineCo
       }
       // freeCasEndpoint is a special endpoint for sending Free CAS Notification.
       if (casDropped && freeCasEndpoint != null) {
-        freeCasEndpoint.setReplyEndpoint(true);
         try {
+          freeCasEndpoint.setReplyEndpoint(true);
+          freeCasEndpoint.setIsCasMultiplier(true);
+          freeCasEndpoint.setFreeCasEndpoint(true);
           // send Free CAS Notification to a Cas Multiplier
           getOutputChannel().sendRequest(AsynchAEMessage.ReleaseCAS, aCasReferenceId,
                   freeCasEndpoint);
@@ -2343,13 +2363,13 @@ public class AggregateAnalysisEngineController_impl extends BaseAnalysisEngineCo
     }
   }
 
-  private void dispatch(String aCasReferenceId, Endpoint anEndpoint) throws AsynchAEException {
+  private void dispatch(CacheEntry entry, Endpoint anEndpoint) throws AsynchAEException {
     if (!anEndpoint.isRemote()) {
       try {
         UimaTransport transport = getTransport(anEndpoint.getEndpoint());
         UimaMessage message = transport.produceMessage(AsynchAEMessage.Process,
                 AsynchAEMessage.Request, getName());
-        message.addStringProperty(AsynchAEMessage.CasReference, aCasReferenceId);
+        message.addStringProperty(AsynchAEMessage.CasReference, entry.getCasReferenceId());
         transport.getUimaMessageDispatcher(anEndpoint.getEndpoint()).dispatch(message);
 
       } catch (Exception e) {
@@ -2370,9 +2390,9 @@ public class AggregateAnalysisEngineController_impl extends BaseAnalysisEngineCo
       // is in this state, delay CASes by placing them on a list of
       // CASes pending dispatch. Once the ping reply is received all
       // delayed CASes will be dispatched to the delegate.
-      if (!delayCasIfDelegateInTimedOutState(aCasReferenceId, anEndpoint.getDelegateKey())) {
+      if (!delayCasIfDelegateInTimedOutState(entry.getCasReferenceId(), anEndpoint.getDelegateKey())) {
         // The delegate is in the normal state so send it this CAS
-        getOutputChannel().sendRequest(aCasReferenceId, anEndpoint);
+        getOutputChannel().sendRequest(AsynchAEMessage.Process, entry.getCasReferenceId(), anEndpoint);
       }
     }
   }
@@ -2406,13 +2426,13 @@ public class AggregateAnalysisEngineController_impl extends BaseAnalysisEngineCo
     return false; // Cas Not Delayed
   }
 
-  private void dispatchProcessRequest(String aCasReferenceId, Endpoint anEndpoint,
+  private void dispatchProcessRequest(CacheEntry entry, Endpoint anEndpoint,
           boolean addEndpointToCache) throws AsynchAEException {
     if (addEndpointToCache) {
-      getInProcessCache().addEndpoint(anEndpoint, aCasReferenceId);
+      getInProcessCache().addEndpoint(anEndpoint, entry.getCasReferenceId());
     }
     anEndpoint.setController(this);
-    dispatch(aCasReferenceId, anEndpoint);
+    dispatch(entry, anEndpoint);
 
   }
 
@@ -2439,29 +2459,38 @@ public class AggregateAnalysisEngineController_impl extends BaseAnalysisEngineCo
       endpoint = lookUpEndpoint(key, true);
       getInProcessCache().addEndpoint(endpoint, aCasReferenceId);
     }
-    dispatchProcessRequest(aCasReferenceId, endpoint, addEndpointToCache);
+    if ( getInProcessCache().entryExists(aCasReferenceId) ) {
+      dispatchProcessRequest(getInProcessCache().getCacheEntryForCAS(aCasReferenceId), endpoint, addEndpointToCache);
+    }
   }
 
-  private void dispatchProcessRequest(String aCasReferenceId, Endpoint[] anEndpointList,
+  private void dispatchProcessRequest(CacheEntry entry, Endpoint[] anEndpointList,
           boolean addEndpointToCache) throws AsynchAEException {
     List<Endpoint> endpointList = new ArrayList<Endpoint>();
     for (int i = 0; i < anEndpointList.length; i++) {
       // Check if the delegate previously timed out. If so, add the CAS
       // Id to the list pending dispatch. This list holds CASes that are
       // delayed until the service responds to a Ping.
-      if (delayCasIfDelegateInTimedOutState(aCasReferenceId, anEndpointList[i].getEndpoint())) {
+      if (delayCasIfDelegateInTimedOutState(entry.getCasReferenceId(), anEndpointList[i].getEndpoint())) {
         // The CAS was delayed until the delegate responds to a Ping
         continue;
       } else {
         endpointList.add(anEndpointList[i]);
       }
       if (addEndpointToCache) {
-        getInProcessCache().addEndpoint(anEndpointList[i], aCasReferenceId);
+        getInProcessCache().addEndpoint(anEndpointList[i], entry.getCasReferenceId());
       }
     }
     Endpoint[] endpoints = new Endpoint[endpointList.size()];
     endpointList.toArray(endpoints);
-    getOutputChannel().sendRequest(aCasReferenceId, endpoints);
+    for (Endpoint endpoint : endpoints) {
+      if (endpoint.isRemote()) {
+        //  In Parallel Step serialization must be xmi.Binary serialization doesnt support merge.
+        endpoint.setSerializer("xmi");
+        getOutputChannel().sendRequest(AsynchAEMessage.Process, entry.getCasReferenceId(), endpoint);
+      }    
+    }
+
   }
 
   public boolean isDelegateKeyValid(String aDelegateKey) {
@@ -2655,7 +2684,6 @@ public class AggregateAnalysisEngineController_impl extends BaseAnalysisEngineCo
         //  
         if (collocatedAggregate || resource instanceof ProcessingResourceMetaData) {
           if (allTypeSystemsMerged()) {
-
             for (int i = 0; i < remoteCasMultiplierList.size(); i++) {
               Endpoint endpt = (Endpoint) destinationMap.get((String) remoteCasMultiplierList
                       .get(i));
@@ -2813,7 +2841,6 @@ public class AggregateAnalysisEngineController_impl extends BaseAnalysisEngineCo
       throw new AsynchAEException("Controller:" + getComponentName()
               + " Unable To Dispatch GetMeta Request. Provided Endpoint is Invalid (NULL)");
     }
-    anEndpoint.startMetadataRequestTimer();
     anEndpoint.setController(this);
     anEndpoint.setWaitingForResponse(true);
     String key = lookUpDelegateKey(anEndpoint.getEndpoint());
@@ -2839,7 +2866,7 @@ public class AggregateAnalysisEngineController_impl extends BaseAnalysisEngineCo
 
       }
     }
-    getOutputChannel().sendRequest(AsynchAEMessage.GetMeta, anEndpoint);
+    getOutputChannel().sendRequest(AsynchAEMessage.GetMeta, null, anEndpoint);
   }
 
   public void retryMetadataRequest(Endpoint anEndpoint) throws AsynchAEException {
@@ -2915,11 +2942,7 @@ public class AggregateAnalysisEngineController_impl extends BaseAnalysisEngineCo
 
   public void retryLastCommand(int aCommand, Endpoint anEndpoint, String aCasReferenceId) {
     try {
-      if (AsynchAEMessage.Process == aCommand) {
-        getOutputChannel().sendRequest(aCasReferenceId, anEndpoint);
-      } else {
-        getOutputChannel().sendRequest(aCommand, anEndpoint);
-      }
+      getOutputChannel().sendRequest(aCommand, aCasReferenceId, anEndpoint);
     } catch (AsynchAEException e) {
 
     }
@@ -3052,7 +3075,66 @@ public class AggregateAnalysisEngineController_impl extends BaseAnalysisEngineCo
       }
     }
   }
+  
+  public void changeCollocatedDelegateState( String delegateKey, ServiceState state ) throws Exception {
+    if ( delegateKey != null && state != null ) {
+      synchronized(childControllerList) {
+        if ( childControllerList.size() > 0 ) {
+          for( AnalysisEngineController childController : childControllerList ) {
+            if ( delegateKey.equals(childController.getKey())) {
+              childController.changeState(state);
+            }
+          }
+        }
+      }
+    } else {
+      throw new Exception("Controller:"+getComponentName()+" Unable to change state of colocated delegate");
+    }
+  }
 
+  
+  public void dumpState(StringBuffer buffer, String lbl1) {
+    
+    StringBuffer delegates = new StringBuffer();
+    if ( buffer.length() == 0) {
+      delegates.append("\n"+lbl1+getComponentName()+" Delegates:");
+    }
+    synchronized(destinationMap) {
+      Set set = destinationMap.entrySet();
+      // For all delegates ...
+      for (Iterator it = set.iterator(); it.hasNext();) {
+        delegates.append("\n");
+        Map.Entry entry = (Map.Entry) it.next();
+        Endpoint endpoint = (Endpoint) entry.getValue();
+        ServiceState state = ServiceState.INITIALIZING;
+        if ( endpoint.isRemote() ) {
+            if ( endpoint.isInitialized() ) {
+              state = ServiceState.RUNNING;
+            }
+            delegates.append(lbl1+lbl1+"Remote Delegate:"+endpoint.getDelegateKey()+" State: "+state.toString());
+        } else {
+          if ( endpoint.isInitialized() ) {
+            state = ServiceState.RUNNING;
+          }
+          delegates.append(lbl1+lbl1+"Co-located Delegate:"+endpoint.getDelegateKey()+" State: "+state.toString());
+          //  If a delegate is an aggregate, call its dumpState method
+          synchronized(childControllerList) {
+            if ( childControllerList.size() > 0 ) {
+              for( AnalysisEngineController childController : childControllerList ) {
+                if ( endpoint.getDelegateKey().equals(childController.getKey()) && !childController.isPrimitive()) {
+                  buffer.append(delegates.toString());
+                  childController.dumpState(buffer,lbl1+lbl1);
+                  delegates.setLength(0);
+                }
+              }
+            }
+          }
+        }
+      }
+      
+    }
+    buffer.append(delegates.toString());
+  }
   public LocalCache getLocalCache() {
     return localCache;
   }

@@ -43,13 +43,13 @@
        element, and just changing the following two properties -->  
   <scm>
     <connection>
-      scm:svn:http://svn.apache.org/repos/asf/uima/${uimaScmRoot}/tags/uima-as-2.3.1/${uimaScmProject}
+      scm:svn:http://svn.apache.org/repos/asf/uima/uima-as/tags/uima-as-2.3.1-rc7/uimaj-as-activemq
     </connection>
     <developerConnection>
-      scm:svn:https://svn.apache.org/repos/asf/uima/${uimaScmRoot}/tags/uima-as-2.3.1/${uimaScmProject}
+      scm:svn:https://svn.apache.org/repos/asf/uima/uima-as/tags/uima-as-2.3.1-rc7/uimaj-as-activemq
     </developerConnection>
     <url>
-      http://svn.apache.org/viewvc/uima/${uimaScmRoot}/tags/uima-as-2.3.1/${uimaScmProject}
+      http://svn.apache.org/viewvc/uima/uima-as/tags/uima-as-2.3.1-rc7/uimaj-as-activemq
     </url>
   </scm>
   
@@ -120,6 +120,12 @@
       <version>3.0.3.RELEASE</version>
     </dependency>
 
+    <dependency>
+      <groupId>org.springframework</groupId>
+      <artifactId>spring-aop</artifactId>
+      <version>3.0.3.RELEASE</version>
+    </dependency>
+    
     <dependency>
       <groupId>org.springframework</groupId>
       <artifactId>spring-beans</artifactId>
@@ -233,9 +239,6 @@
 					</includes>
 				</configuration>
 		  </plugin>
-      
-         
-      		
 	  </plugins>
 	  <pluginManagement>
       <plugins>
@@ -256,5 +259,41 @@
       </plugin>
       </plugins>
 	  </pluginManagement>		
-	</build>	
+	</build>
+	
+	<profiles>
+      <profile>
+        <id>extended-test</id>      
+        <build>
+          <plugins>
+		    <plugin>
+			  <groupId>org.apache.maven.plugins</groupId>
+			  <artifactId>maven-failsafe-plugin</artifactId>
+			  <version>2.7.2</version>
+		        <executions>
+		          <execution>
+		            <id>integration-test</id>
+		            <goals>
+		              <goal>integration-test</goal>
+		            </goals>
+		          </execution>
+		          <execution>
+		            <id>verify</id>
+		            <goals>
+		              <goal>verify</goal>
+		            </goals>
+		          </execution>
+		        </executions>
+			  <configuration>
+			    <argLine>-Xmx1024M</argLine>
+			    <encoding>UTF-8</encoding>
+			    <includes>
+				  <include>**/TestUimaASExtended.java</include>
+				</includes>
+			 </configuration>
+		  </plugin>
+        </plugins>     
+      </build>
+    </profile>
+  </profiles> 
 </project>

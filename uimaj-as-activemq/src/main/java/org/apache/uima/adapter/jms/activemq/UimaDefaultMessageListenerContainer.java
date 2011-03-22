@@ -19,16 +19,17 @@
 
 package org.apache.uima.adapter.jms.activemq;
 
-import java.lang.reflect.Method;
 import java.net.ConnectException;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 
-import javax.jms.Connection;
 import javax.jms.ConnectionFactory;
 import javax.jms.Destination;
 import javax.jms.ExceptionListener;
@@ -37,7 +38,6 @@ import javax.jms.TemporaryQueue;
 
 import org.apache.activemq.ActiveMQConnection;
 import org.apache.activemq.ActiveMQConnectionFactory;
-import org.apache.activemq.ActiveMQPrefetchPolicy;
 import org.apache.activemq.command.ActiveMQDestination;
 import org.apache.uima.UIMAFramework;
 import org.apache.uima.aae.InputChannel;
@@ -45,9 +45,9 @@ import org.apache.uima.aae.UIMAEE_Constants;
 import org.apache.uima.aae.UimaAsThreadFactory;
 import org.apache.uima.aae.controller.AggregateAnalysisEngineController;
 import org.apache.uima.aae.controller.AnalysisEngineController;
+import org.apache.uima.aae.controller.BaseAnalysisEngineController.ServiceState;
 import org.apache.uima.aae.controller.Endpoint;
 import org.apache.uima.aae.controller.PrimitiveAnalysisEngineController;
-import org.apache.uima.aae.controller.BaseAnalysisEngineController.ServiceState;
 import org.apache.uima.aae.delegate.Delegate;
 import org.apache.uima.aae.error.ErrorHandler;
 import org.apache.uima.aae.error.Threshold;
@@ -104,10 +104,20 @@ public class UimaDefaultMessageListenerContainer extends DefaultMessageListenerC
 
   private volatile boolean awaitingShutdown = false;
   
-  private boolean brokerWithDaemonThreads = false;
+  //  When set to true, this flag prevents spring from using refreshUntilSuccessful
+  //  logic which attempts to recover the connection. This flag is set to true during the
+  //  service shutdown
+  public static volatile boolean terminating;
+
+  private ThreadPoolExecutor threadPoolExecutor = null;
+  
+  private boolean pluginThreadPool;
   
   public UimaDefaultMessageListenerContainer() {
     super();
+    // reset global static. This only effects unit testing as services are deployed 
+    // in the same process.
+    terminating = false;
     UIMAFramework.getLogger(CLASS_NAME).setLevel(Level.WARNING);
     __listenerRef = this;
     setRecoveryInterval(5);
@@ -121,7 +131,24 @@ public class UimaDefaultMessageListenerContainer extends DefaultMessageListenerC
     this();
     this.freeCasQueueListener = freeCasQueueListener;
   }
+  /**
+   * Overriden Spring's method that tries to recover from lost connection. We dont 
+   * want to recover when the service is stopping.
+   */
+  protected void refreshConnectionUntilSuccessful() {
+	  if ( !terminating ) {
+		  super.refreshConnectionUntilSuccessful();
+	  }
+  }
+  protected void recoverAfterListenerSetupFailure() {
+	  if ( !terminating ) {
+		  super.recoverAfterListenerSetupFailure();
+	  }
+  }
 
+  public void setTerminating() {
+    terminating = true;
+  }
   public void setController(AnalysisEngineController aController) {
     controller = aController;
   }
@@ -205,7 +232,13 @@ public class UimaDefaultMessageListenerContainer extends DefaultMessageListenerC
     // the cause. Just the top level IllegalStateException with a text message. This is what we need
     // to
     // check for.
-    if (t instanceof javax.jms.IllegalStateException
+    ActiveMQConnection conn = null;
+    try {
+      conn = (ActiveMQConnection)getSharedConnection();
+    } catch( Exception exx ) { // shared connection  may not exist yet if a broker is not up
+    }
+    if ( (conn != null && conn.isTransportFailed() ) || 
+            t instanceof javax.jms.IllegalStateException
             && t.getMessage().equals("The Consumer is closed")) {
       if (controller != null && controller instanceof AggregateAnalysisEngineController) {
         String delegateKey = ((AggregateAnalysisEngineController) controller)
@@ -389,11 +422,8 @@ public class UimaDefaultMessageListenerContainer extends DefaultMessageListenerC
    */
   protected void handleListenerSetupFailure(Throwable t, boolean alreadyHandled) {
     // If shutdown already, nothing to do
-    if (awaitingShutdown) {
-      return;
-    }
-    // If controller is stopping not need to recover the connection
-    if (controller != null && controller.isStopped()) {
+	    // If controller is stopping no need to recover the connection
+    if (awaitingShutdown || terminating || (controller != null && controller.isStopped()) ) {
       return;
     }
     if ( controller != null ) {
@@ -520,8 +550,6 @@ public class UimaDefaultMessageListenerContainer extends DefaultMessageListenerC
     try {
 
       injectConnectionFactory();
-      initializeTaskExecutor();
-      injectTaskExecutor();
       super.initialize();
     } catch (Exception e) {
       if (UIMAFramework.getLogger(CLASS_NAME).isLoggable(Level.WARNING)) {
@@ -561,14 +589,15 @@ public class UimaDefaultMessageListenerContainer extends DefaultMessageListenerC
       super.setMessageListener(messageListener);
     }
   }
-
+  public void afterPropertiesSet() {
+    afterPropertiesSet(true);
+  }
   /**
    * Called by Spring and some Uima AS components when all properties have been set. This method
    * spins a thread in which the listener is initialized.
    */
-  public void afterPropertiesSet() {
+  public void afterPropertiesSet(final boolean propagate) {
     if (endpoint != null) {
-
 			// Override the prefetch size. The dd2spring always sets this to 1 which 
 			// may effect the throughput of a service. Change the prefetch size to
 			// number of consumer threads defined in DD.
@@ -590,7 +619,8 @@ public class UimaDefaultMessageListenerContainer extends DefaultMessageListenerC
       super.setConcurrentConsumers(1);
       if (cc > 1) {
         try {
-          concurrentListener = new ConcurrentMessageListener(cc, ml, getDestinationName());
+          String prefix = endpoint.getDelegateKey()+" Reply Thread";
+          concurrentListener = new ConcurrentMessageListener(cc, ml, getDestinationName(), threadGroup,prefix);
           super.setMessageListener(concurrentListener);
         } catch (Exception e) {
           if (UIMAFramework.getLogger(CLASS_NAME).isLoggable(Level.WARNING)) {
@@ -607,11 +637,11 @@ public class UimaDefaultMessageListenerContainer extends DefaultMessageListenerC
           return;
         }
       } else {
-        super.setMessageListener(ml);
+        pluginThreadPool = true;
       }
     } else {
-      super.setMessageListener(ml);
       super.setConcurrentConsumers(cc);
+      pluginThreadPool = true;
     }
     Thread t = new Thread(threadGroup, new Runnable() {
       public void run() {
@@ -643,14 +673,25 @@ public class UimaDefaultMessageListenerContainer extends DefaultMessageListenerC
           }
           // Plug in connection Factory to Spring's Listener
           __listenerRef.injectConnectionFactory();
+          
+          if ( pluginThreadPool ) {
+            setUimaASThreadPoolExecutor(cc);
+          }
+          
           // Initialize the TaskExecutor. This call injects a custom Thread Pool into the
           // TaskExecutor provided in the spring xml. The custom thread pool initializes
           // an instance of AE in a dedicated thread
-          initializeTaskExecutor();
-          // Plug in TaskExecutor to Spring's Listener
-          __listenerRef.injectTaskExecutor();
-          // Notify Spring Listener that all properties are ready
-          __listenerRef.allPropertiesSet();
+          if ( getMessageSelector() != null && !isGetMetaListener()) {
+            initializeTaskExecutor();
+          }
+          if ( threadPoolExecutor == null ) {
+              // Plug in TaskExecutor to Spring's Listener
+              __listenerRef.injectTaskExecutor();
+          }
+          if ( propagate ) {
+            // Notify Spring Listener that all properties are ready
+            __listenerRef.allPropertiesSet();
+          }
           if (isActiveMQDestination() && destination != null) {
             destinationName = ((ActiveMQDestination) destination).getPhysicalName();
           }
@@ -686,6 +727,9 @@ public class UimaDefaultMessageListenerContainer extends DefaultMessageListenerC
                   "afterPropertiesSet", JmsConstants.JMS_LOG_RESOURCE_BUNDLE,
                   "UIMAJMS_jms_listener_failed_WARNING",
                   new Object[] { destination, getBrokerUrl(), e });
+          UIMAFramework.getLogger(CLASS_NAME).logrb(Level.WARNING, CLASS_NAME.getName(),
+                  "afterPropertiesSet", JmsConstants.JMS_LOG_RESOURCE_BUNDLE,
+                  "UIMAJMS_exception__WARNING", e);
         }
       }
     });
@@ -747,11 +791,12 @@ public class UimaDefaultMessageListenerContainer extends DefaultMessageListenerC
     ((TempDestinationResolver) resolver).setListener(this);
     super.setDestinationResolver(resolver);
   }
-
+  /**
+   * Closes shares connection to a broker
+  **/
   public void closeConnection() throws Exception {
     try {
       setRecoveryInterval(0);
-      setAcceptMessagesWhileStopping(false);
       setAutoStartup(false);
       if ( getSharedConnection() != null ) {
         ActiveMQConnection amqc = (ActiveMQConnection)getSharedConnection();
@@ -867,82 +912,50 @@ public class UimaDefaultMessageListenerContainer extends DefaultMessageListenerC
     //  we will start listeners on input queue.
     this.setAutoStartup(false);
   }
+  public void shutdownTaskExecutor(ThreadPoolExecutor tpe) throws InterruptedException {
+    tpe.purge();
+    tpe.shutdownNow();
+  }
   /**
    * Spins a shutdown thread and stops Sprint and ActiveMQ threads.
    * 
    */
   public void destroy() {
+	  
     if (awaitingShutdown) {
       return;
     }
-    awaitingShutdown = true;
-    
-    // Spin a thread that will wait until all threads complete. This is needed to avoid
-    // memory leak caused by the fact that we did not wait to collect the threads
+    // Spin a thread that will shutdown all taskExecutors and wait for their threads to stop.
+    // A separate thread is necessary since we cant stop a threadPoolExecutor if one of its
+    // threads is busy stopping the executor. This leads to a hang.
     Thread threadGroupDestroyer = new Thread(threadGroup.getParent().getParent(),
             "threadGroupDestroyer") {
       public void run() {
         try {
-        	if ( !__listenerRef.awaitingShutdown && __listenerRef.isRunning() ) {
-                // stop Spring listener and ActiveMQ threads
-                __listenerRef.stop();
-                __listenerRef.closeConnection();
+          if ( !__listenerRef.awaitingShutdown ) {
+        	    awaitingShutdown = true;
+                // delegate stop request to Spring 
+              __listenerRef.delegateStop();
+              if (taskExecutor != null && taskExecutor instanceof ThreadPoolTaskExecutor) {
+                ((ThreadPoolTaskExecutor) taskExecutor).getThreadPoolExecutor().purge();
+                  ((ThreadPoolTaskExecutor) taskExecutor).getThreadPoolExecutor().shutdownNow();
+                } else if (concurrentListener != null) {
+                  shutdownTaskExecutor(concurrentListener.getTaskExecutor());
+                  concurrentListener.stop();
+                } else if ( threadPoolExecutor != null ) {
+                  shutdownTaskExecutor(threadPoolExecutor);
+                }
         	}
+          __listenerRef.shutdown();
         } catch (Exception e) {
+          UIMAFramework.getLogger(CLASS_NAME).logrb(Level.WARNING, this.getClass().getName(),
+                  "destroy", JmsConstants.JMS_LOG_RESOURCE_BUNDLE,
+                  "UIMAJMS_exception__WARNING", e);
         }
-        // If using non-default TaskExecutor, stop its threads
-        if (taskExecutor != null && taskExecutor instanceof ThreadPoolTaskExecutor) {
-          ((ThreadPoolTaskExecutor) taskExecutor).getThreadPoolExecutor().shutdown();
-          // Since the calling thread may be one of those managed by the executor allow
-          // for one open thread when checking active thread count.
-          while (((ThreadPoolTaskExecutor) taskExecutor).getThreadPoolExecutor().getActiveCount() > 1
-                  && !((ThreadPoolTaskExecutor) taskExecutor).getThreadPoolExecutor()
-                          .isTerminated()) {
-            try {
-              ((ThreadPoolTaskExecutor) taskExecutor).getThreadPoolExecutor().awaitTermination(200,
-                      TimeUnit.MILLISECONDS);
-            } catch (Exception e) {
-            }
-          }
-        } else if (concurrentListener != null) {
-          // Stop internal Executor
-          concurrentListener.stop();
-        }
-        // Shutdown the listener
-        __listenerRef.shutdown();
+
         if (UIMAFramework.getLogger(CLASS_NAME).isLoggable(Level.FINEST)) {
           threadGroup.getParent().list();
         }
-        // Wait until all threads are accounted for
-        while (threadGroup.activeCount() > 0) {
-          try {
-            Thread[] threads = new Thread[threadGroup.activeCount()];
-            threadGroup.enumerate(threads);
-            boolean foundExpectedThreads = true;
-
-            for (Thread t : threads) {
-              try {
-            	  if ( !isAmqThread(t) ) {
-                      foundExpectedThreads = false;
-                      break; // from for
-            	  }
-            	// Check if there are still any non-daemon threads left in the thread group
-                if ( !t.isDaemon() ) {
-                    foundExpectedThreads = false;
-                    break; // from for
-                	
-                }
-              } catch (Exception e) {
-              }
-            }
-            if (foundExpectedThreads) {
-              break; // from while
-            }
-            Thread.sleep(100);
-          } catch (InterruptedException e) {
-          }
-        }
-
         try {
           synchronized (threadGroup) {
             if (!threadGroup.isDestroyed()) {
@@ -957,18 +970,35 @@ public class UimaDefaultMessageListenerContainer extends DefaultMessageListenerC
     
     
   }
-  private boolean isAmqThread(Thread t) {
-	  String tName = t.getName();
-	  // The following is necessary to account for the AMQ threads
-	  // Any threads not named in the list below will cause a wait
-	  // and retry until all non-amq threads are stopped
-	  if (!tName.startsWith("main") && !tName.equalsIgnoreCase("timer-0")
-	          && !tName.equals("ReaderThread") && !tName.equals("BrokerThreadGroup")
-	          && !tName.startsWith("ActiveMQ")) {
-	    return false;
-	  }
-	  return true;
+  
+  private void setUimaASThreadPoolExecutor(int consumentCount) throws Exception{
+    super.setMessageListener(ml);
+    // create task executor with custom thread pool for:
+    // 1) GetMeta request processing
+    // 2) ReleaseCAS request
+    if ( taskExecutor == null ) {
+      UimaAsThreadFactory tf = new UimaAsThreadFactory(threadGroup);
+      tf.setDaemon(true);
+      if ( isFreeCasQueueListener()) {
+        tf.setThreadNamePrefix(controller.getComponentName()+" - FreeCASRequest Thread");
+      } else if ( isGetMetaListener()  ) {
+        tf.setThreadNamePrefix(super.getBeanName()+" - Thread");
+      } else if ( getDestination() != null && getMessageSelector() != null ) {
+        tf.setThreadNamePrefix(controller.getComponentName() + " Process Thread");
+      } else if ( endpoint != null && endpoint.isTempReplyDestination() ) {
+        tf.setThreadNamePrefix(super.getBeanName()+" - Thread");
+      } else { 
+        throw new Exception("Unknown Context Detected in setUimaASThreadPoolExecutor()");
+      }
+      ExecutorService es = Executors.newFixedThreadPool(consumentCount,tf);
+      if ( es instanceof ThreadPoolExecutor ) {
+          threadPoolExecutor = (ThreadPoolExecutor)es;
+          super.setTaskExecutor(es);
+      }
+    }
   }
+
+  
   /**
    * Called by Spring to inject TaskExecutor
    */
@@ -1002,6 +1032,7 @@ public class UimaDefaultMessageListenerContainer extends DefaultMessageListenerC
       // PrimitiveController so that every thread can call it to initialize
       // the next available instance of a AE.
       tf = new UimaAsThreadFactory(threadGroup, (PrimitiveAnalysisEngineController) controller);
+      ((UimaAsThreadFactory)tf).setDaemon(true);
       // This ThreadExecutor will use custom thread factory instead of defult one
       ((ThreadPoolTaskExecutor) taskExecutor).setThreadFactory(tf);
       // Initialize the thread pool
@@ -1014,10 +1045,15 @@ public class UimaDefaultMessageListenerContainer extends DefaultMessageListenerC
         controller.changeState(ServiceState.RUNNING);
       }
     }
+    
+    if ( threadPoolExecutor != null ) {
+    	threadPoolExecutor.prestartAllCoreThreads();
+    }
   }
-
+  public void delegateStop() {
+    super.stop();
+  }
   public void stop() throws JmsException {
-    setAcceptMessagesWhileStopping(false);
     destroy();
   }
 }

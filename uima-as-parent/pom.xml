@@ -45,13 +45,13 @@
 
   <scm>
     <connection>
-      scm:svn:http://svn.apache.org/repos/asf/uima/uima-as/tags/uima-as-2.3.1/uima-as-parent
+      scm:svn:http://svn.apache.org/repos/asf/uima/uima-as/tags/uima-as-2.3.1-rc7/uima-as-parent
     </connection>
     <developerConnection>
-      scm:svn:https://svn.apache.org/repos/asf/uima/uima-as/tags/uima-as-2.3.1/uima-as-parent
+      scm:svn:https://svn.apache.org/repos/asf/uima/uima-as/tags/uima-as-2.3.1-rc7/uima-as-parent
     </developerConnection>
     <url>
-      http://svn.apache.org/viewvc/uima/uima-as/tags/uima-as-2.3.1/uima-as-parent
+      http://svn.apache.org/viewvc/uima/uima-as/tags/uima-as-2.3.1-rc7/uima-as-parent
     </url>
   </scm>
 
@@ -100,7 +100,10 @@
 
     </repository>
 
-    <repository>
+  </repositories>
+
+  <pluginRepositories>
+    <pluginRepository>
       <id>apache.snapshots.plugins</id>
       <name>Apache Snapshot Repository - Maven plugins</name>
       <url>http://repository.apache.org/snapshots</url>
@@ -113,9 +116,9 @@
         <checksumPolicy>fail</checksumPolicy>
         <updatePolicy>never</updatePolicy>
       </snapshots>
-    </repository>
-  </repositories>
-
+    </pluginRepository>
+    
+  </pluginRepositories>
   <properties>
     <uimaScmRoot>uima-as</uimaScmRoot>
     <uimaScmProject>${project.artifactId}</uimaScmProject>

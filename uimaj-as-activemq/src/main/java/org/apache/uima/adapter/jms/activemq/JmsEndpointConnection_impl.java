@@ -19,6 +19,8 @@
 
 package org.apache.uima.adapter.jms.activemq;
 
+import java.io.IOException;
+import java.io.InterruptedIOException;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.Map;
@@ -385,7 +387,7 @@ public class JmsEndpointConnection_impl implements ConsumerListener {
 		    }
 		    try {
 		       if (aTextMessage == null) {
-		          return producerSession.createTextMessage();
+		          return producerSession.createTextMessage("");
 		       } else {
 		          return producerSession.createTextMessage(aTextMessage);
 		       }
@@ -412,17 +414,20 @@ public class JmsEndpointConnection_impl implements ConsumerListener {
 	}
   }
 
-  public BytesMessage produceByteMessage() throws AsynchAEException {
+  public BytesMessage produceByteMessage(byte[] aSerializedCAS) throws AsynchAEException {
     synchronized( lock ) {
         if ( producerSession == null ) {
             throw new AsynchAEException("Controller:"+controller.getComponentName()+" Unable to create JMS Message. Producer Session Not Initialized (Null)");
           }
-          boolean done = false;
-          int retryCount = 4;
+          int retryCount = 1;
           while (retryCount > 0) {
             try {
               retryCount--;
-              return producerSession.createBytesMessage();
+              BytesMessage bm = producerSession.createBytesMessage();
+              bm.writeBytes(aSerializedCAS);
+
+              return bm;
+
             } catch (javax.jms.IllegalStateException e) {
               try {
                 open();
@@ -506,11 +511,20 @@ public class JmsEndpointConnection_impl implements ConsumerListener {
 
   public boolean send(final Message aMessage, long msgSize, boolean startTimer, boolean failOnJMSException) {
     String destinationName = "";
+    String target = "Delegate";
 
     try {
       int msgType = aMessage.getIntProperty(AsynchAEMessage.MessageType);
       int command = aMessage.getIntProperty(AsynchAEMessage.Command);
-
+      boolean newCAS = false;
+      if ( aMessage.propertyExists(AsynchAEMessage.CasSequence) &&
+              aMessage.getLongProperty(AsynchAEMessage.CasSequence) > 0 ) {
+        newCAS = true;
+      }
+      
+      if ( msgType == AsynchAEMessage.Response || (msgType == AsynchAEMessage.Request && newCAS) ) {
+        target = "Client";
+      }
       Endpoint masterEndpoint = null;
       if ( delegateEndpoint != null && delegateEndpoint.getDelegateKey() != null ) {
         masterEndpoint = ((AggregateAnalysisEngineController) controller).lookUpEndpoint(
@@ -530,7 +544,7 @@ public class JmsEndpointConnection_impl implements ConsumerListener {
           map.put(AsynchAEMessage.Command, AsynchAEMessage.Process);
           map.put(AsynchAEMessage.CasReference, aMessage.getStringProperty(AsynchAEMessage.CasReference));
           map.put(AsynchAEMessage.Endpoint, masterEndpoint);
-          Exception e = new DelegateConnectionLostException("Controller:"+controller.getComponentName()+" Lost Connection to Delegate:"+masterEndpoint.getDelegateKey());
+          Exception e = new DelegateConnectionLostException("Controller:"+controller.getComponentName()+" Lost Connection to "+target+ ":"+masterEndpoint.getDelegateKey());
           if (UIMAFramework.getLogger(CLASS_NAME).isLoggable(Level.WARNING)) {
             
             UIMAFramework.getLogger(CLASS_NAME).logrb(Level.WARNING, CLASS_NAME.getName(),
@@ -581,6 +595,7 @@ public class JmsEndpointConnection_impl implements ConsumerListener {
         synchronized (producer) {
           producer.send(aMessage);
         }
+
       }
       // Starts a timer on a broker connection. Every time a new message
       // is sent to a destination managed by the broker the timer is
@@ -595,9 +610,23 @@ public class JmsEndpointConnection_impl implements ConsumerListener {
     } catch (Exception e) {
       if (UIMAFramework.getLogger(CLASS_NAME).isLoggable(Level.WARNING)) {
         
-        UIMAFramework.getLogger(CLASS_NAME).logrb(Level.WARNING, CLASS_NAME.getName(),
-                "send", UIMAEE_Constants.JMS_LOG_RESOURCE_BUNDLE,
-                "UIMAEE_service_exception_WARNING", controller.getComponentName());
+        String key = "";
+        String endpointName = "";
+        if ( delegateEndpoint != null ) {
+          delegateEndpoint.getDelegateKey();
+          endpointName = ((ActiveMQDestination) delegateEndpoint.getDestination())
+          .getPhysicalName();
+        }
+        if ( "Client".equals(target) ) {
+          UIMAFramework.getLogger(CLASS_NAME).logrb(Level.WARNING, CLASS_NAME.getName(),
+                  "send", UIMAEE_Constants.JMS_LOG_RESOURCE_BUNDLE,
+                  "UIMAEE_service_delivery_to_client_exception__WARNING",
+                  new Object[] { controller.getComponentName(),endpointName });
+        } else {
+          UIMAFramework.getLogger(CLASS_NAME).logrb(Level.WARNING, CLASS_NAME.getName(),
+                  "send", UIMAEE_Constants.JMS_LOG_RESOURCE_BUNDLE,
+                  "UIMAEE_service_delivery_exception__WARNING",new Object[] { controller.getComponentName(), key, endpointName});
+        }
 
         UIMAFramework.getLogger(CLASS_NAME).logrb(Level.WARNING, CLASS_NAME.getName(),
                 "send", JmsConstants.JMS_LOG_RESOURCE_BUNDLE,

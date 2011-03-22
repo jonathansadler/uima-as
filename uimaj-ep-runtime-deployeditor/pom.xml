@@ -44,13 +44,13 @@
        element, and just changing the following two properties -->  
   <scm>
     <connection>
-      scm:svn:http://svn.apache.org/repos/asf/uima/${uimaScmRoot}/tags/uima-as-2.3.1/${uimaScmProject}
+      scm:svn:http://svn.apache.org/repos/asf/uima/uima-as/tags/uima-as-2.3.1-rc7/uimaj-ep-runtime-deployeditor
     </connection>
     <developerConnection>
-      scm:svn:https://svn.apache.org/repos/asf/uima/${uimaScmRoot}/tags/uima-as-2.3.1/${uimaScmProject}
+      scm:svn:https://svn.apache.org/repos/asf/uima/uima-as/tags/uima-as-2.3.1-rc7/uimaj-ep-runtime-deployeditor
     </developerConnection>
     <url>
-      http://svn.apache.org/viewvc/uima/${uimaScmRoot}/tags/uima-as-2.3.1/${uimaScmProject}
+      http://svn.apache.org/viewvc/uima/uima-as/tags/uima-as-2.3.1-rc7/uimaj-ep-runtime-deployeditor
     </url>
   </scm>
   
@@ -103,8 +103,10 @@
             </Export-Package>
 
             <Bundle-SymbolicName>org.apache.uima.runtime.fragments.deployeditor;singleton:=true</Bundle-SymbolicName>
-
-            <Fragment-Host>org.apache.uima.runtime;bundle-version="${parsedVersion.osgiVersion}"</Fragment-Host>
+            <!-- Uncomment Line below for the actual release -->
+            <!-- Fragment-Host>org.apache.uima.runtime;bundle-version="${parsedVersion.osgiVersion}"</Fragment-Host -->
+            <!-- Remove below line for the actual release -->
+            <Fragment-Host>org.apache.uima.runtime;bundle-version="2.3.1"</Fragment-Host>
           </instructions>
         </configuration>
       </plugin>

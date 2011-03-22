@@ -106,6 +106,7 @@ public abstract class BaseAnalysisEngineController extends Resource_ImplBase imp
   private static final Class CLASS_NAME = BaseAnalysisEngineController.class;
   private static final String JMS_PROVIDER_HOME = "ACTIVEMQ_HOME";
   public static enum ServiceState { INITIALIZING, RUNNING, DISABLED, STOPPING, FAILED };
+  public static final boolean NO_RECOVERY = true;
   
   protected ServiceState currentState = ServiceState.INITIALIZING;
   
@@ -246,8 +247,11 @@ public abstract class BaseAnalysisEngineController extends Resource_ImplBase imp
   private static final UimaAsVersion uimaAsVersion = new UimaAsVersion();
   // Holds destination names of clients known to be dead
   protected ConcurrentHashMap<String,String> deadClientDestinationMap = new ConcurrentHashMap<String, String>();
-
   
+  private String serviceName=null;
+  
+  public abstract void dumpState(StringBuffer buffer, String lbl1);
+
   public BaseAnalysisEngineController() {
 
   }
@@ -308,7 +312,6 @@ public abstract class BaseAnalysisEngineController extends Resource_ImplBase imp
 
     endpointName = anEndpointName;
     delegateKey = anEndpointName;
-
     if (this instanceof AggregateAnalysisEngineController) {
       ConcurrentHashMap endpoints = new ConcurrentHashMap();
       endpoints.putAll(aDestinationMap);
@@ -536,7 +539,7 @@ public abstract class BaseAnalysisEngineController extends Resource_ImplBase imp
 
       StringBuffer platformInfo = new StringBuffer();
       platformInfo.append("\n+------------------------------------------------------------------");
-      platformInfo.append("\n                   Starting UIMA AS Service - PID:" + processPid);
+      platformInfo.append("\n                   Starting UIMA AS Service - PID: " + processPid);
       platformInfo.append("\n+------------------------------------------------------------------");
       platformInfo.append("\n+ Service Name:" + serviceName);
       platformInfo.append("\n+ Service Queue Name:" + endpointName);
@@ -930,12 +933,55 @@ public abstract class BaseAnalysisEngineController extends Resource_ImplBase imp
   public boolean isTopLevelComponent() {
     return (parentController == null);
   }
-
+  private String setupName() {
+    //return ((ResourceCreationSpecifier) resourceSpecifier).getMetaData().getName();
+    String serviceName = ((ResourceCreationSpecifier) resourceSpecifier).getMetaData().getName();
+    if ( serviceName == null || serviceName.trim().length() == 0 ) {
+      
+      if ( isTopLevelComponent() ) {
+        if ( isPrimitive() ) {
+          String implementationName = ((ResourceCreationSpecifier) resourceSpecifier).getImplementationName();
+          if ( implementationName.indexOf(".") > 0) {
+            implementationName = implementationName.substring(implementationName.lastIndexOf(".")+1);
+          }
+          serviceName = implementationName;
+        } else {
+          serviceName = "Top Level Aggregate Service";
+        }
+      } else {
+        try {
+          UimaContext childContext = parentController.getChildUimaContext(endpointName);
+          serviceName = ((UimaContextAdmin)childContext).getQualifiedContextName();
+          if ( serviceName != null ) {
+            if ( serviceName.startsWith("/")) {
+              serviceName = serviceName.substring(1);
+              serviceName = serviceName.replaceAll("/", "_"); // normalize
+              if ( serviceName.endsWith("_")) {
+                serviceName = serviceName.substring(0, serviceName.length()-1);
+              }
+            }
+          }
+        } catch( Exception e){
+          serviceName = delegateKey;
+        }
+      }
+      if (UIMAFramework.getLogger(CLASS_NAME).isLoggable(Level.INFO)) {
+        UIMAFramework.getLogger(CLASS_NAME).logrb(Level.INFO, CLASS_NAME.getName(),
+                "setupName", UIMAEE_Constants.JMS_LOG_RESOURCE_BUNDLE,
+                "UIMAEE_using_generated_name_INFO", new Object[] { serviceName });
+      }
+    
+    } 
+    return serviceName;
+  }
   /**
    * Returns the name of the component. The name comes from the analysis engine descriptor
    */
   public String getComponentName() {
-    return ((ResourceCreationSpecifier) resourceSpecifier).getMetaData().getName();
+    if ( serviceName == null ) {
+      serviceName = setupName();
+    }
+    return serviceName;
   }
 
   /**
@@ -1401,6 +1447,10 @@ public abstract class BaseAnalysisEngineController extends Resource_ImplBase imp
 
   public String getName() {
     return endpointName;
+  }
+
+  public String getKey() {
+    return delegateKey;
   }
 
   public void process(CAS aCas, String aCasId) {
@@ -1880,6 +1930,8 @@ public abstract class BaseAnalysisEngineController extends Resource_ImplBase imp
       // then wait until all CASes still in play are processed. When all CASes are processed
       // we proceed with the shutdown of delegates and finally of the top level service.
       if (isTopLevelComponent()) {
+          getInputChannel().setTerminating();
+
         // Stops all input channels of this service, but keep temp reply queue input channels open
         // to process replies.
         stopInputChannels(InputChannel.InputChannels);
@@ -1916,6 +1968,7 @@ public abstract class BaseAnalysisEngineController extends Resource_ImplBase imp
                   "quiesceAndStop", UIMAEE_Constants.JMS_LOG_RESOURCE_BUNDLE,
                   "UIMAEE_onEmpty_callback_received__INFO", new Object[] { getComponentName() });
         }
+        getInputChannel().terminate();
         stop();
       }
     }
@@ -1958,8 +2011,15 @@ public abstract class BaseAnalysisEngineController extends Resource_ImplBase imp
     } else if (!isStopped()) {
       stopDelegateTimers();
       getOutputChannel().cancelTimers();
+      InputChannel iC = getInputChannel(endpointName);
+      if ( iC != null) {
+          iC.setTerminating();
+      }
       // Stop the inflow of new input CASes
       stopInputChannel();
+      if ( iC != null ) {
+        iC.terminate();
+      }
       stopCasMultipliers();
       stopTransportLayer();
       if (cause != null && aCasReferenceId != null) {
@@ -2103,54 +2163,61 @@ public abstract class BaseAnalysisEngineController extends Resource_ImplBase imp
       }
     }
   }
-
+  private void setInputChannelForNoRecovery() {
+	  if ( inputChannelMap.size() > 0 ) {
+		  InputChannel iC = getInputChannel();
+		  iC.setTerminating();
+	  }
+  }
+  protected void stopInputChannels( int channelsToStop) {   //, boolean norecovery) {
+	    InputChannel iC = null;
+	    setInputChannelForNoRecovery();
+	    Iterator it = inputChannelMap.keySet().iterator();
+	    int i = 1;
+	    while (it.hasNext()) {
+	      try {
+	        String key = (String) it.next();
+	        if (key != null && key.trim().length() > 0) {
+	          iC = (InputChannel) inputChannelMap.get(key);
+	          if (iC != null) {
+	            if (channelsToStop == InputChannel.InputChannels && iC.getServiceInfo() != null
+	                    && iC.getServiceInfo().getInputQueueName().startsWith("top_level_input_queue")) {
+	              // This closes both listeners on the input queue: Process Listener and GetMeta
+	              // Listener
+	            	iC.stop(channelsToStop);
+	              return; // Just closed input channels. Keep the others open
+	            }
+	            iC.stop(channelsToStop);
+	          }
+	        }
+	        i++;
+	      } catch (Exception e) {
+	        if (iC != null) {
+	          if (UIMAFramework.getLogger(CLASS_NAME).isLoggable(Level.INFO)) {
+	            UIMAFramework.getLogger(CLASS_NAME).logrb(Level.INFO, getClass().getName(),
+	                    "stopInputChannels", UIMAEE_Constants.JMS_LOG_RESOURCE_BUNDLE,
+	                    "UIMAEE_unable_to_stop_inputchannel__INFO",
+	                    new Object[] { getComponentName(), iC.getInputQueueName() });
+	          }
+	        } else {
+	          if (UIMAFramework.getLogger(CLASS_NAME).isLoggable(Level.WARNING)) {
+	            UIMAFramework.getLogger(CLASS_NAME).logrb(Level.WARNING, CLASS_NAME.getName(),
+	                    "stopInputChannels", UIMAEE_Constants.JMS_LOG_RESOURCE_BUNDLE,
+	                    "UIMAEE_service_exception_WARNING", getComponentName());
+	            UIMAFramework.getLogger(CLASS_NAME).logrb(Level.WARNING, getClass().getName(),
+	                    "stopInputChannels", UIMAEE_Constants.JMS_LOG_RESOURCE_BUNDLE,
+	                    "UIMAEE_exception__WARNING", e);
+	          }
+	        }
+	      }
+	    }
+	  
+  }
   /**
    * Aggregates have more than one Listener channel. This method stops all configured input channels
    * this service is configured with.
    * 
    */
-  protected void stopInputChannels(int channelsToStop) {
-    InputChannel iC = null;
-    Iterator it = inputChannelMap.keySet().iterator();
-    int i = 1;
-    while (it.hasNext()) {
-      try {
-        String key = (String) it.next();
-        if (key != null && key.trim().length() > 0) {
-          iC = (InputChannel) inputChannelMap.get(key);
-          if (iC != null) {
-            if (channelsToStop == InputChannel.InputChannels && iC.getServiceInfo() != null
-                    && iC.getServiceInfo().getInputQueueName().startsWith("top_level_input_queue")) {
-              // This closes both listeners on the input queue: Process Listener and GetMeta
-              // Listener
-              iC.stop(channelsToStop);
-              return; // Just closed input channels. Keep the others open
-            }
-            iC.stop(channelsToStop);
-          }
-        }
-        i++;
-      } catch (Exception e) {
-        if (iC != null) {
-          if (UIMAFramework.getLogger(CLASS_NAME).isLoggable(Level.INFO)) {
-            UIMAFramework.getLogger(CLASS_NAME).logrb(Level.INFO, getClass().getName(),
-                    "stopInputChannels", UIMAEE_Constants.JMS_LOG_RESOURCE_BUNDLE,
-                    "UIMAEE_unable_to_stop_inputchannel__INFO",
-                    new Object[] { getComponentName(), iC.getInputQueueName() });
-          }
-        } else {
-          if (UIMAFramework.getLogger(CLASS_NAME).isLoggable(Level.WARNING)) {
-            UIMAFramework.getLogger(CLASS_NAME).logrb(Level.WARNING, CLASS_NAME.getName(),
-                    "stopInputChannels", UIMAEE_Constants.JMS_LOG_RESOURCE_BUNDLE,
-                    "UIMAEE_service_exception_WARNING", getComponentName());
-            UIMAFramework.getLogger(CLASS_NAME).logrb(Level.WARNING, getClass().getName(),
-                    "stopInputChannels", UIMAEE_Constants.JMS_LOG_RESOURCE_BUNDLE,
-                    "UIMAEE_exception__WARNING", e);
-          }
-        }
-      }
-    }
-  }
 
   public AnalysisEngineController getCasMultiplierController(String cmKey) {
     List<AnalysisEngineController> colocatedControllerList = 
@@ -2703,6 +2770,7 @@ public abstract class BaseAnalysisEngineController extends Resource_ImplBase imp
     }
   }
   
+
   public Map<String,String> getDeadClientMap() {
 	  return deadClientDestinationMap;
   }
