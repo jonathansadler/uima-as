@@ -105,6 +105,9 @@ public abstract class BaseAnalysisEngineController extends Resource_ImplBase imp
   private static final String JMS_PROVIDER_HOME = "ACTIVEMQ_HOME";
   public static enum ServiceState { INITIALIZING, RUNNING, DISABLED, STOPPING, FAILED };
   public static final boolean NO_RECOVERY = true;
+  // Semaphore use only when quiesceAndStop is called
+  // When the cache becomes empty the semaphore is released.
+  private Semaphore quiesceSemaphore = new Semaphore(0);
   
   protected ServiceState currentState = ServiceState.INITIALIZING;
   
@@ -1895,7 +1898,6 @@ public abstract class BaseAnalysisEngineController extends Resource_ImplBase imp
         }
       }
     }
-
     if (daemonServiceExecutor != null) {
       daemonServiceExecutor.shutdown();
     }
@@ -1907,8 +1909,8 @@ public abstract class BaseAnalysisEngineController extends Resource_ImplBase imp
     if (getOutputChannel() != null) {
       getOutputChannel().cancelTimers();
     }
+    
     if (this instanceof PrimitiveAnalysisEngineController) {
-
       getControllerLatch().release();
       // Stops the input channel of this service
       stopInputChannels(InputChannel.CloseAllChannels, shutdownNow);
@@ -1946,7 +1948,6 @@ public abstract class BaseAnalysisEngineController extends Resource_ImplBase imp
          }
        }
     }   
-    
     getInProcessCache().releaseAllCASes();
     getLocalCache().clear();
     releasedAllCASes = true;
@@ -2019,7 +2020,13 @@ public abstract class BaseAnalysisEngineController extends Resource_ImplBase imp
     super.destroy();
 
   }
-
+  /**
+   * This method is called by InProcessCache when the cache becomes empty while the controller
+   * is in Quiesce mode.
+   */
+  public void notifyOnCacheEmpty() {
+    quiesceSemaphore.release();
+  }
   /**
    * Stops input channel(s) and waits for CASes still in play to complete processing. When the
    * InProcessCache becomes empty, initiate the service shutdown.
@@ -2030,6 +2037,10 @@ public abstract class BaseAnalysisEngineController extends Resource_ImplBase imp
               UIMAEE_Constants.JMS_LOG_RESOURCE_BUNDLE, "UIMAEE_stop__INFO",
               new Object[] { getComponentName() });
     }
+    System.out.println("Quiescing UIMA-AS Service. Remaining Number of CASes to Process:"+getInProcessCache().getSize());
+    // Register callback when the inProcessCache becomes empty
+    getInProcessCache().registerController(this);
+    
     if (!isStopped() && !callbackReceived) {
       getControllerLatch().release();
       // To support orderly shutdown, the service must first stop its input channel and
@@ -2040,7 +2051,7 @@ public abstract class BaseAnalysisEngineController extends Resource_ImplBase imp
 
         // Stops all input channels of this service, but keep temp reply queue input channels open
         // to process replies.
-        stopReceivingCASes();
+        stopReceivingCASes(false);  // dont kill listeners on temp queues. The remotes may send replies
         if ( this instanceof PrimitiveAnalysisEngineController_impl &&
         		((PrimitiveAnalysisEngineController_impl)this).aeInstancePool != null ) {
         	//	Since we are quiescing, destroy all AEs that are in AE pool. Those that
@@ -2065,12 +2076,24 @@ public abstract class BaseAnalysisEngineController extends Resource_ImplBase imp
         	}
         }
         stopInputChannels(InputChannel.InputChannels, true);  
-        // close JMS connection 
-        stop(false); // wait for any remaining CASes in flight to finish
+       
+        try {
+          if ( !getInProcessCache().isEmpty() ) {
+            // acquire semaphore and wait for the InProcessCache to call notifyOnCacheEmpty()
+            // on this controller when the cache becomes empty.
+            quiesceSemaphore.acquire();
+          }
+          stopReceivingCASes(true);
+          stopInputChannels(InputChannel.InputChannels, true);  
+          System.out.println("UIMA-AS Service is Stopping, All CASes Have Been Processed");
+        } catch( InterruptedException e) {
+          
+        }
+        stop(true); 
       }
     }
   }
-
+  
   protected void stopDelegateTimers() {
     Iterator<Delegate> it = delegates.iterator();
     while (it.hasNext()) {
@@ -2263,7 +2286,7 @@ public abstract class BaseAnalysisEngineController extends Resource_ImplBase imp
 		  iC.setTerminating();
 	  }
   }
-  protected void stopReceivingCASes()  {
+  protected void stopReceivingCASes(boolean stopAllListeners)  {
 	  
 	    InputChannel iC = null;
 	    setInputChannelForNoRecovery();
@@ -2273,9 +2296,13 @@ public abstract class BaseAnalysisEngineController extends Resource_ImplBase imp
 	        String key = it.next();
 	        if (key != null && key.trim().length() > 0) {
 	          iC = (InputChannel) inputChannelMap.get(key);
-	          if (iC != null) {
-	        	  iC.disconnectListenersFromQueue();
-               }
+	          if (iC != null ) {
+	        	  if ( stopAllListeners ) {
+                iC.disconnectListenersFromQueue();
+	        	  } else if ( iC.getInputQueueName() != null && !iC.getInputQueueName().startsWith("temp-queue")) {
+                iC.disconnectListenersFromQueue();
+	        	  }
+            }
 	        }
 	      } catch (Exception e) {
 	        if (iC != null) {
