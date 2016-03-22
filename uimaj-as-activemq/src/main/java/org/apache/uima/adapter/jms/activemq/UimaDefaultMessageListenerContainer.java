@@ -22,6 +22,7 @@ package org.apache.uima.adapter.jms.activemq;
 import java.lang.reflect.Method;
 import java.net.ConnectException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
@@ -182,7 +183,8 @@ public class UimaDefaultMessageListenerContainer extends DefaultMessageListenerC
     		          doLogFailureMsg = false;
     		        }
     		      }
-    		      sleepInbetweenRecoveryAttempts();
+    		     // sleepInbetweenRecoveryAttempts();
+    		      setRecoveryInterval(10);
     		    }	    
     	}
     } catch( IllegalStateException e ) {
@@ -848,6 +850,10 @@ public class UimaDefaultMessageListenerContainer extends DefaultMessageListenerC
 
   public void setConnectionFactory(ConnectionFactory aConnectionFactory) {
     connectionFactory = aConnectionFactory;
+    ConnectionFactoryIniter cfIniter =
+            new ConnectionFactoryIniter((ActiveMQConnectionFactory)connectionFactory);
+    cfIniter.whiteListPackages();
+
     super.setConnectionFactory(connectionFactory);
   }
 
