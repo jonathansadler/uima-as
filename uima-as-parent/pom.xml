@@ -154,13 +154,12 @@
 
 		<xpp3.version>1.1.4c</xpp3.version>
 		
-		<http.client.version>4.2.5</http.client.version>
+		<http.client.version>4.5.1</http.client.version>
 		
-		<http.core.version>4.2.4</http.core.version>
+		<http.core.version>4.4.4</http.core.version>
 		
         <hawtbuff.version>1.11</hawtbuff.version>		
 		
-        
         <!-- Needed for NOTICE file packaged in each jar under META-INF -->
 		<uimaASNoticeText>
 Portions of UIMA-AS were originally developed by
